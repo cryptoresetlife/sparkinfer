@@ -706,7 +706,17 @@ bool test_schema_keyword_type_applicability() {
 }
 
 bool test_unsupported_schema_keywords_are_rejected() {
-    for (const char* unsupported : {"const", "multipleOf", "oneOf"}) {
+    // const, multipleOf, oneOf, anyOf, allOf, prefixItems, $ref and $defs all MOVED OUT of this
+    // list in #981: validate_value() enforces every one of them now, so rejecting them would
+    // refuse schemas this server can honour. They are covered by test_schema_keywords_981(),
+    // which asserts ENFORCEMENT rather than mere acceptance.
+    //
+    // What stays here is the set validate_value() cannot enforce. That distinction is the whole
+    // contract: a keyword is accepted only if the validator checks it, because this backend does
+    // no constrained decoding and an unchecked keyword would let the model violate a constraint
+    // the caller believes is in force. Do not move anything into the supported list without
+    // implementing it first.
+    for (const char* unsupported : {"not", "if", "patternProperties", "uniqueItems", "contains"}) {
         json body = {
             {"messages", {{{"role", "user"}, {"content", "test"}}}},
             {"tools", json::array({{
@@ -716,9 +726,9 @@ bool test_unsupported_schema_keywords_are_rejected() {
                     {"parameters", {
                         {"type", "object"},
                         {"properties", {{"value", {{"type", "integer"},
-                                                     {unsupported, unsupported == std::string("oneOf")
-                                                         ? json::array({json{{"type", "integer"}}})
-                                                         : json(2)}}}}}
+                                                     {unsupported, unsupported == std::string("uniqueItems")
+                                                         ? json(true)
+                                                         : json{{"type", "integer"}}}}}}}
                     }}
                 }}
             }})}
@@ -772,6 +782,77 @@ bool test_parallel_tool_calls() {
     single_request["parallel_tool_calls"] = false;
     CHECK(parse_request(single_request.dump(), request));
     CHECK(!request.parallel_tool_calls);
+    return true;
+}
+
+bool test_schema_keywords_981() {
+    // #981: keywords are accepted ONLY if validate_value() enforces them. A keyword that is
+    // whitelisted but unchecked turns an honest 400 into a model silently violating a constraint,
+    // which is strictly worse -- so each accepted keyword is tested for ENFORCEMENT, not just for
+    // being parseable.
+    auto req_with = [](const std::string& params) {
+        return std::string(R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function",)"
+                           R"("function":{"name":"f","description":"d","parameters":)") + params + "}}]}";
+    };
+    ChatRequest request;
+
+    // x-* vendor extensions: accepted and ignored (MCP servers emit these).
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"string",)"
+                                 R"("x-mcp-header":"X-Trace"}}})"), request));
+    // const / anyOf / oneOf / multipleOf / format now parse.
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"const":"only"}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":[{"type":"string"},{"type":"null"}]}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"oneOf":[{"type":"string"},{"type":"integer"}]}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"number","multipleOf":5}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"string","format":"date-time"}}})"), request));
+
+    // A rejected keyword must stay rejected INSIDE a composition branch too. Whitelisting anyOf
+    // at the parent while never descending into its branches would let a caller smuggle $ref into
+    // one, where validate_value ignores the unknown key and the branch then matches anything --
+    // the anyOf passes trivially while the caller believes a constraint is in force.
+    // An unresolvable $ref inside a branch is refused at PARSE time, not deferred to the first
+    // tool call that happens to exercise that branch.
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":[{"$ref":"#/$defs/T"}]}}})"), request));
+    // ...and a still-unsupported keyword cannot hide in a branch either.
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":[{"not":{"type":"string"}}]}}})"), request));
+    // allOf is supported now, so smuggling must be tested with a keyword that is still refused.
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"oneOf":[{"type":"string"},{"patternProperties":{"^x":{"type":"string"}}}]}}})"), request));
+    // Empty or non-array compositions are refused rather than silently treated as "no constraint".
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":[]}}})"), request));
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"anyOf":{"type":"string"}}}})"), request));
+
+    // allOf / prefixItems / $ref+$defs are now enforced too, so they parse.
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"allOf":[{"type":"string"},{"minLength":2}]}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","properties":{"a":{"type":"array","prefixItems":[{"type":"string"}],"items":{"type":"integer"}}}})"), request));
+    CHECK(parse_request(req_with(R"({"type":"object","$defs":{"T":{"type":"string"}},"properties":{"a":{"$ref":"#/$defs/T"}}})"), request));
+
+    // A $ref must RESOLVE. An unresolvable one would validate against nothing.
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"$ref":"#/$defs/Missing"}}})"), request));
+    // External refs are refused rather than fetched -- dereferencing caller-supplied URLs is the
+    // same SSRF primitive parse_image_url already refuses.
+    CHECK(!parse_request(req_with(R"({"type":"object","properties":{"a":{"$ref":"https://example.com/s.json"}}})"), request));
+    // $ref with sibling constraints: draft-07 ignores the siblings, so accepting this would
+    // silently drop them. Refused rather than accepted-and-ignored.
+    CHECK(!parse_request(req_with(R"({"type":"object","$defs":{"T":{"type":"string"}},"properties":{"a":{"$ref":"#/$defs/T","minLength":3}}})"), request));
+    // A rejected keyword must not hide inside a $defs body either.
+    CHECK(!parse_request(req_with(R"({"type":"object","$defs":{"T":{"unknownKeyword":1}},"properties":{"a":{"$ref":"#/$defs/T"}}})"), request));
+    return true;
+}
+
+bool test_case_insensitive_tool_names_981() {
+    // Qwen3.8 emits <function=Read> for an offered `read`; a strict compare failed the whole
+    // agent loop over the model's choice of spelling.
+    const std::string body =
+        R"({"messages":[{"role":"user","content":"go"}],"tools":[{"type":"function","function":)"
+        R"({"name":"read","description":"d","parameters":{"type":"object","properties":{}}}}]})";
+    ChatRequest request;
+    CHECK(parse_request(body, request));
+    const std::string raw = "<tool_call>\n<function=Read>\n</function>\n</tool_call>";
+    const ParsedToolOutput out = parse_qwen36_tool_output(raw, false, request);
+    CHECK(out.error.empty());
+    CHECK(out.tool_calls.size() == 1);
+    // Echoed back with the CLIENT's spelling, not the model's -- the client dispatches on its own.
+    CHECK(out.tool_calls[0].name == "read");
     return true;
 }
 
@@ -1698,6 +1779,8 @@ int main() {
     if (!test_schema_keyword_type_applicability()) return 1;
     if (!test_unsupported_schema_keywords_are_rejected()) return 1;
     if (!test_parallel_tool_calls()) return 1;
+    if (!test_schema_keywords_981()) return 1;
+    if (!test_case_insensitive_tool_names_981()) return 1;
     if (!test_reasoning_effort_controls()) return 1;
     if (!test_plain_answer()) return 1;
     if (!test_control_markup_never_leaks_as_content()) return 1;

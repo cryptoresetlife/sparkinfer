@@ -1,6 +1,7 @@
 #include "chat_tools.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -199,10 +200,20 @@ std::string qwen_template_json(const json& value) {
 }
 
 bool is_allowed_key(const json& object, const std::set<std::string>& allowed,
-                    const std::string& where, std::string& err) {
+                    const std::string& where, std::string& err,
+                    bool allow_vendor_extensions = false) {
     for (const auto& item : object.items()) {
-        if (!allowed.count(item.key()))
-            return set_error(err, where + " contains unsupported field " + item.key());
+        if (allowed.count(item.key())) continue;
+        // Vendor extensions. JSON Schema reserves no "x-" prefix itself, but OpenAPI-derived
+        // tooling uses it universally and MCP servers emit it (x-mcp-header and friends). Like
+        // $schema/$comment these carry no constraint, so accepting and dropping them is faithful
+        // rather than permissive -- there is nothing for constrained decoding to enforce, so
+        // ignoring them cannot weaken a guarantee (#981).
+        //
+        // Opt-in per call site: this is right for a tool's JSON Schema, and wrong for the request
+        // envelope, where an unexpected x- key more likely means a client mistake worth surfacing.
+        if (allow_vendor_extensions && item.key().rfind("x-", 0) == 0) continue;
+        return set_error(err, where + " contains unsupported field " + item.key());
     }
     return true;
 }
@@ -396,21 +407,48 @@ bool require_keyword_type(const json& schema, const std::string& where,
     return true;
 }
 
+// Defined below, next to validate_value(); declared here because schema validation resolves
+// $ref at parse time so an unresolvable pointer is refused when the tool is submitted.
+const json* resolve_local_ref(const json& root, const std::string& ref);
+
 bool valid_schema_node(const json& schema, const std::string& where, bool top_level,
-                       std::string& err) {
+                       std::string& err, const json* root = nullptr) {
+    // The top-level schema is the root: that is where $defs lives, and every $ref below resolves
+    // against it. Threading it lets an unresolvable $ref be refused at PARSE time rather than
+    // surfacing later as an argument-validation failure -- a schema whose $ref points nowhere is
+    // broken as written, and saying so when it is submitted is far more useful to the caller than
+    // a 400 on the first tool call that happens to exercise that branch.
+    if (!root) root = &schema;
     if (!schema.is_object()) return set_error(err, where + " must be an object");
     // "$schema" and "$comment" carry no constraints -- they are annotations a validator is
     // required to ignore -- so accepting and dropping them is faithful, not permissive. Clients
     // built on @ai-sdk/openai-compatible emit "$schema" on every tool schema, and rejecting it
     // failed the whole request. Structural "$" keywords ($ref/$defs/$id) are deliberately still
     // refused: silently ignoring a $ref would validate the arguments against nothing.
+    //
+    // allOf and prefixItems are likewise still refused. allOf needs schema intersection, which is
+    // genuinely hard in the general case; prefixItems needs positional item schemas. Neither is
+    // implemented in validate_value(), so accepting them would be exactly the silent weakening
+    // this comment warns about. A 400 naming the field is the honest answer until they are.
     if (!is_allowed_key(schema,
                         {"$schema", "$comment",
                          "type", "description", "default", "title", "properties",
                          "required", "additionalProperties", "items", "enum", "minimum",
                          "maximum", "exclusiveMinimum", "exclusiveMaximum", "minItems",
-                         "maxItems", "minLength", "maxLength", "pattern"},
-                        where, err)) return false;
+                         "maxItems", "minLength", "maxLength", "pattern",
+                         // Every keyword below is ENFORCED in validate_value(). Nothing is
+                         // whitelisted that the validator ignores: this backend has no
+                         // constrained decoding, so a keyword accepted but unchecked would turn
+                         // an honest 400 into a model silently violating the constraint.
+                         "const", "anyOf", "oneOf", "allOf", "multipleOf", "prefixItems",
+                         // $ref is resolved against $defs/definitions in validate_value(), local
+                         // pointers only -- an external ref is refused rather than fetched.
+                         "$ref", "$defs", "definitions",
+                         // "format" is the one exception, and it is not an exception to that
+                         // rule: JSON Schema defines format as an ANNOTATION by default, not an
+                         // assertion, so ignoring it enforces exactly what the spec requires.
+                         "format"},
+                        where, err, /*allow_vendor_extensions=*/true)) return false;
     for (const char* annotation : {"$schema", "$comment"}) {
         if (schema.contains(annotation) && !schema[annotation].is_string())
             return set_error(err, where + "." + annotation + " must be a string");
@@ -457,12 +495,54 @@ bool valid_schema_node(const json& schema, const std::string& where, bool top_le
                                       " requires type number or integer");
         }
     }
+    // Composition branches are schemas too, and MUST be validated as such. Whitelisting anyOf at
+    // the parent while never descending into its branches would let a caller hide a rejected
+    // keyword inside one -- {"anyOf": [{"$ref": "..."}]} -- where validate_value() then ignores
+    // the unknown key, constrains nothing, and the branch matches anything. The anyOf would pass
+    // trivially while the caller believes a constraint is in force: exactly the silent weakening
+    // that refusing $ref at the top level exists to prevent.
+    // A $ref node is validated against its target, and draft-07 ignores sibling keywords -- so a
+    // node carrying $ref plus constraints would silently drop those constraints. Refuse it instead
+    // of accepting a schema whose visible text does not describe what is enforced.
+    if (schema.contains("$ref")) {
+        if (!schema["$ref"].is_string())
+            return set_error(err, where + ".$ref must be a string");
+        for (const auto& item : schema.items())
+            if (item.key() != "$ref" && item.key() != "$comment" && item.key() != "description" &&
+                item.key().rfind("x-", 0) != 0)
+                return set_error(err, where + " combines $ref with " + item.key() +
+                                      ", which would be silently ignored");
+        if (!resolve_local_ref(*root, schema["$ref"].get<std::string>()))
+            return set_error(err, where + " has an unresolvable or non-local $ref: " +
+                                  schema["$ref"].get<std::string>());
+    }
+    // $defs / definitions hold schemas, so they are validated as schemas. Without this a rejected
+    // keyword could hide in a definition and reach validate_value through a $ref.
+    for (const char* defs : {"$defs", "definitions"}) {
+        if (!schema.contains(defs)) continue;
+        if (!schema[defs].is_object())
+            return set_error(err, std::string(where) + "." + defs + " must be an object");
+        for (const auto& def : schema[defs].items())
+            if (!valid_schema_node(def.value(), where + "." + defs + "." + def.key(), false, err, root))
+                return false;
+    }
+    for (const char* composition : {"anyOf", "oneOf", "allOf"}) {
+        if (!schema.contains(composition)) continue;
+        const json& branches = schema[composition];
+        if (!branches.is_array() || branches.empty())
+            return set_error(err, where + "." + composition + " must be a non-empty array");
+        for (size_t i = 0; i < branches.size(); ++i) {
+            if (!valid_schema_node(branches[i],
+                                   where + "." + composition + "[" + std::to_string(i) + "]",
+                                   false, err, root)) return false;
+        }
+    }
     if (schema.contains("properties")) {
         if (!schema["properties"].is_object())
             return set_error(err, where + ".properties must be an object");
         for (const auto& property : schema["properties"].items()) {
             if (!valid_schema_node(property.value(), where + ".properties." + property.key(),
-                                   false, err)) return false;
+                                   false, err, root)) return false;
         }
     }
     if (schema.contains("required")) {
@@ -485,11 +565,19 @@ bool valid_schema_node(const json& schema, const std::string& where, bool top_le
         return set_error(err, where + ".additionalProperties must be boolean or an object schema");
     if (schema.contains("additionalProperties") && schema["additionalProperties"].is_object() &&
         !valid_schema_node(schema["additionalProperties"], where + ".additionalProperties",
-                           false, err)) return false;
+                           false, err, root)) return false;
+    if (schema.contains("prefixItems")) {
+        if (!schema["prefixItems"].is_array() || schema["prefixItems"].empty())
+            return set_error(err, where + ".prefixItems must be a non-empty array");
+        for (size_t i = 0; i < schema["prefixItems"].size(); ++i)
+            if (!valid_schema_node(schema["prefixItems"][i],
+                                   where + ".prefixItems[" + std::to_string(i) + "]", false, err,
+                                   root)) return false;
+    }
     if (schema.contains("items")) {
         if (!schema["items"].is_object())
             return set_error(err, where + ".items must be an object schema");
-        if (!valid_schema_node(schema["items"], where + ".items", false, err)) return false;
+        if (!valid_schema_node(schema["items"], where + ".items", false, err, root)) return false;
     }
     if (schema.contains("enum") &&
         (!schema["enum"].is_array() || schema["enum"].empty()))
@@ -788,8 +876,119 @@ bool utf8_code_point_count(const std::string& value, std::size_t& count) {
     return true;
 }
 
-bool validate_value(const json& value, const json& schema, const std::string& path, std::string& err) {
+// Resolves a local JSON pointer of the form "#/$defs/Name" or "#/definitions/Name" against the
+// root schema. LOCAL ONLY: an external "$ref" (http://, file://, or any other document) is refused
+// rather than fetched -- an inference server that dereferences caller-supplied URLs is the same
+// SSRF primitive parse_image_url already refuses, and a file:// ref would read local paths.
+bool validate_value(const json& value, const json& schema, const std::string& path,
+                    std::string& err, const json* root = nullptr, int depth = 0);
+
+const json* resolve_local_ref(const json& root, const std::string& ref) {
+    if (ref.rfind("#/", 0) != 0) return nullptr;      // "#" alone, or an external document
+    const json* node = &root;
+    size_t pos = 2;
+    while (pos <= ref.size()) {
+        const size_t next = ref.find('/', pos);
+        std::string token = ref.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        // RFC 6901 escaping: ~1 is '/', ~0 is '~', and in that order.
+        for (size_t i = 0; (i = token.find("~1", i)) != std::string::npos; ) token.replace(i, 2, "/");
+        for (size_t i = 0; (i = token.find("~0", i)) != std::string::npos; ) token.replace(i, 2, "~");
+        if (!node->is_object() || !node->contains(token)) return nullptr;
+        node = &(*node)[token];
+        if (next == std::string::npos) break;
+        pos = next + 1;
+    }
+    return node->is_object() ? node : nullptr;
+}
+
+// Nesting bound for validation. $ref makes a schema a graph rather than a tree, so a self- or
+// mutually-referential definition can recurse forever on a value that never shrinks. Bounding the
+// depth turns that into a clean rejection instead of a stack overflow; 64 is far past any real
+// tool schema and well inside the stack.
+constexpr int kMaxSchemaDepth = 64;
+
+bool validate_value(const json& value, const json& schema, const std::string& path, std::string& err,
+                    const json* root, int depth) {
     if (!schema.is_object()) return true;
+    if (depth > kMaxSchemaDepth)
+        return set_error(err, path + " exceeds the maximum schema nesting depth");
+    // The top-level schema IS the root when no other is supplied -- that is where $defs lives.
+    if (!root) root = &schema;
+
+    if (schema.contains("$ref")) {
+        if (!schema["$ref"].is_string())
+            return set_error(err, path + " has a non-string $ref");
+        const std::string ref = schema["$ref"].get<std::string>();
+        const json* target = resolve_local_ref(*root, ref);
+        if (!target) return set_error(err, path + " has an unresolvable or non-local $ref: " + ref);
+        // A node carrying $ref is validated against its target. Sibling keywords are ignored, per
+        // draft-07 semantics -- accepting them silently would be the usual weakening, so
+        // valid_schema_node refuses a $ref node that carries anything else.
+        return validate_value(value, *target, path, err, root, depth + 1);
+    }
+
+    // --- composition and single-literal keywords (#981) -------------------------------------
+    // These are ENFORCED here, not merely whitelisted. This backend does no constrained decoding
+    // -- arguments are validated after the fact -- so accepting a keyword the validator ignores
+    // would replace an honest 400 with a model silently violating the constraint, which is worse
+    // than rejecting it. Every keyword added to the schema whitelist alongside this must appear
+    // below.
+    //
+    // anyOf is the one that actually blocks MCP tools today: `anyOf: [T, null]` is how every
+    // optional/nullable field is expressed.
+    if (schema.contains("const")) {
+        if (value != schema["const"])
+            return set_error(err, path + " does not equal the value required by const");
+    }
+    if (schema.contains("allOf")) {
+        // Trivial in a post-hoc validator: the value must satisfy every branch. The report scoped
+        // this as "schema intersection, genuinely hard" -- true when BUILDING a grammar, where the
+        // branches must be merged into one production. Validating an existing value needs no
+        // merge at all.
+        if (!schema["allOf"].is_array() || schema["allOf"].empty())
+            return set_error(err, path + " has invalid allOf schema");
+        for (const json& sub : schema["allOf"])
+            if (!validate_value(value, sub, path, err, root, depth + 1)) return false;
+    }
+    if (schema.contains("anyOf")) {
+        if (!schema["anyOf"].is_array() || schema["anyOf"].empty())
+            return set_error(err, path + " has invalid anyOf schema");
+        bool any = false;
+        for (const json& sub : schema["anyOf"]) {
+            std::string ignored;   // a failing branch is not an error; only all-failing is
+            if (validate_value(value, sub, path, ignored, root, depth + 1)) { any = true; break; }
+        }
+        if (!any) return set_error(err, path + " does not match any anyOf branch");
+    }
+    if (schema.contains("oneOf")) {
+        if (!schema["oneOf"].is_array() || schema["oneOf"].empty())
+            return set_error(err, path + " has invalid oneOf schema");
+        int matched = 0;
+        for (const json& sub : schema["oneOf"]) {
+            std::string ignored;
+            if (validate_value(value, sub, path, ignored, root, depth + 1)) matched++;
+        }
+        // EXACTLY one, per the spec. Matching several is as much a failure as matching none --
+        // an overlapping oneOf means the caller's schema is ambiguous, and silently accepting the
+        // first hit would hide that.
+        if (matched != 1)
+            return set_error(err, path + " matches " + std::to_string(matched) +
+                                  " oneOf branches, expected exactly 1");
+    }
+    if (schema.contains("multipleOf") && schema["multipleOf"].is_number() && value.is_number()) {
+        const double step = schema["multipleOf"].get<double>();
+        if (step > 0.0) {
+            const double v = value.get<double>();
+            const double rem = std::fabs(v - step * std::round(v / step));
+            // Relative epsilon: 0.1 is not representable in binary, so an exact fmod test rejects
+            // legitimately-conforming values like 0.3 against multipleOf 0.1.
+            if (rem > 1e-9 * std::max(1.0, std::fabs(v)))
+                return set_error(err, path + " is not a multiple of the required step");
+        }
+    }
+    // "format" is deliberately absent: JSON Schema defines it as an ANNOTATION by default, not an
+    // assertion, so accepting and ignoring it is spec-correct rather than a silent weakening.
+
     if (schema.contains("type")) {
         auto matches = [&](const std::string& type) {
             if (type == "object") return value.is_object();
@@ -860,13 +1059,14 @@ bool validate_value(const json& value, const json& schema, const std::string& pa
                                    schema["additionalProperties"] != json(false);
         for (const auto& item : value.items()) {
             if (properties.contains(item.key())) {
-                if (!validate_value(item.value(), properties[item.key()], path + "." + item.key(), err)) return false;
+                if (!validate_value(item.value(), properties[item.key()], path + "." + item.key(), err,
+                                    root, depth + 1)) return false;
             } else if (!allow_unknown) {
                 return set_error(err, path + " contains unknown parameter " + item.key());
             } else if (schema.contains("additionalProperties") &&
                        schema["additionalProperties"].is_object() &&
                        !validate_value(item.value(), schema["additionalProperties"],
-                                       path + "." + item.key(), err)) {
+                                       path + "." + item.key(), err, root, depth + 1)) {
                 return false;
             }
         }
@@ -875,10 +1075,20 @@ bool validate_value(const json& value, const json& schema, const std::string& pa
             return set_error(err, path + " has fewer than minItems elements");
         if (schema.contains("maxItems") && value.size() > schema["maxItems"].get<std::size_t>())
             return set_error(err, path + " has more than maxItems elements");
+        // prefixItems constrains element i by prefixItems[i]; "items" then applies to whatever
+        // remains past the prefix (2020-12 semantics). With no prefixItems this is the previous
+        // behaviour exactly -- prefix_n is 0 and every element goes through "items".
+        const size_t prefix_n = schema.contains("prefixItems") && schema["prefixItems"].is_array()
+                                    ? schema["prefixItems"].size() : 0;
+        for (size_t i = 0; i < prefix_n && i < value.size(); ++i)
+            if (!validate_value(value[i], schema["prefixItems"][i],
+                                path + "[" + std::to_string(i) + "]", err, root, depth + 1))
+                return false;
         if (schema.contains("items")) {
-            for (size_t i = 0; i < value.size(); ++i)
+            for (size_t i = prefix_n; i < value.size(); ++i)
                 if (!validate_value(value[i], schema["items"],
-                                    path + "[" + std::to_string(i) + "]", err)) return false;
+                                    path + "[" + std::to_string(i) + "]", err,
+                                    root, depth + 1)) return false;
         }
     }
     return true;
@@ -920,10 +1130,40 @@ const json* property_schema_for_key(const json& object_schema, const json& prope
     return &unconstrained;
 }
 
+// Exact match first, then ASCII case-insensitive as a fallback.
+//
+// Qwen3.8 capitalises function names in its XML tool calls often enough to matter -- it emits
+// <function=Read> for an offered `read` -- and a strict compare turns that into "model called
+// unoffered function Read", failing an agent loop over a spelling difference the model chose.
+// SGLang and vLLM both normalise (#981).
+//
+// EXACT WINS. The fallback only runs when nothing matched exactly, so a caller that offers both
+// `read` and `Read` keeps the strict behaviour for both, and adding a second casing can never
+// change which tool an existing exact name resolves to.
+//
+// AMBIGUITY KEEPS THE STRICT BEHAVIOUR. If two offered tools differ only by case, a
+// case-insensitive hit is not well defined, so this returns nullptr and the caller reports the
+// name as unoffered -- guessing between them would silently invoke the wrong function.
+//
+// ASCII only, deliberately: a locale-aware or Unicode fold would make the set of matched names
+// depend on the server's locale, and tool names crossing that boundary should fail loudly.
 const ToolDefinition* offered_tool(const ChatRequest& request, const std::string& name) {
     for (const ToolDefinition& tool : request.tools)
         if (tool.name == name) return &tool;
-    return nullptr;
+
+    auto ascii_lower = [](std::string v) {
+        for (char& c : v)
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        return v;
+    };
+    const std::string want = ascii_lower(name);
+    const ToolDefinition* hit = nullptr;
+    for (const ToolDefinition& tool : request.tools) {
+        if (ascii_lower(tool.name) != want) continue;
+        if (hit) return nullptr;   // ambiguous: two offered tools differ only by case
+        hit = &tool;
+    }
+    return hit;
 }
 
 bool parse_one_xml_call(const std::string& block, const ChatRequest& request, ToolCall& call,
@@ -940,6 +1180,11 @@ bool parse_one_xml_call(const std::string& block, const ChatRequest& request, To
         return set_error(err, "tool call has an invalid function name");
     const ToolDefinition* tool = offered_tool(request, call.name);
     if (!tool) return set_error(err, "model called unoffered function " + call.name);
+    // Echo the name back exactly as the CLIENT offered it, not as the model spelled it. The client
+    // dispatches on its own spelling -- returning the model's "Read" for an offered "read" would
+    // resolve here and then miss in the caller's own handler table, moving the failure somewhere
+    // harder to diagnose. No-op when the match was exact (#981).
+    call.name = tool->name;
 
     const json& schema = tool->spec["function"]["parameters"];
     const json properties = schema.value("properties", json::object());
