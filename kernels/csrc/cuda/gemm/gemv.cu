@@ -1100,12 +1100,13 @@ __global__ void gemv_nvfp4_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
 //
 // PRMT AS A BYTE LUT. __byte_perm(a, b, sel) uses four nibbles of `sel` to pick four bytes out of
 // {a, b} -- and the NVFP4 codes ARE nibbles already, so one instruction looks up four magnitudes.
-// A second lookup builds the sign mask (selector nibble 0/1 picks 0x00/0xFF), and __vsub4 applies
-// it byte-wise without borrowing across lanes. That is ~1.75 ALU ops per weight against ~10.5 for
-// the float decode, and the int8 staging is a quarter the registers of the float staging.
+// Small row tiles look up both signed versions and select with a byte sign mask, avoiding
+// the emulated per-byte subtraction. Wider tiles keep the lower-register subtraction path:
+// their larger accumulator set makes the extra signed-table temporaries expensive.
+// Both paths decode exactly the same bytes; selection depends only on the static row tile.
 //
-// -0 is handled: code 8 gives mag 0 and mask 0xFF, and (0 ^ 0xFF) - 0xFF is 0 in byte arithmetic,
-// which is the correct int8 for -0.
+// Both tables map magnitude zero to zero, including the negative-zero code 8.
+template <int R>
 __device__ __forceinline__ void si_nvfp4_i8x8(unsigned p, unsigned& q0, unsigned& q1) {
     // Magnitudes for codes 0..3 and 4..7, one byte each, in the two PRMT source registers.
     const unsigned MAG_LO = 0x03020100u;   // {0, 1, 2, 3}
@@ -1117,8 +1118,17 @@ __device__ __forceinline__ void si_nvfp4_i8x8(unsigned p, unsigned& q0, unsigned
     const unsigned s0 = __byte_perm(SGN, 0u, ssel);
     const unsigned m1 = __byte_perm(MAG_LO, MAG_HI, msel >> 16);
     const unsigned s1 = __byte_perm(SGN, 0u, ssel >> 16);
-    q0 = __vsub4(m0 ^ s0, s0);
-    q1 = __vsub4(m1 ^ s1, s1);
+    if constexpr (R <= 4) {
+        const unsigned NEG_LO = 0xFDFEFF00u;   // {0, -1, -2, -3}
+        const unsigned NEG_HI = 0xF4F8FAFCu;   // {-4, -6, -8, -12}
+        const unsigned n0 = __byte_perm(NEG_LO, NEG_HI, msel);
+        const unsigned n1 = __byte_perm(NEG_LO, NEG_HI, msel >> 16);
+        q0 = (m0 & ~s0) | (n0 & s0);
+        q1 = (m1 & ~s1) | (n1 & s1);
+    } else {
+        q0 = __vsub4(m0 ^ s0, s0);
+        q1 = __vsub4(m1 ^ s1, s1);
+    }
 }
 
 // One thread per 16-element activation group: symmetric int8 with a per-group scale. Matching the
@@ -1216,8 +1226,8 @@ __global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
                     #pragma unroll
                     for (int u = 0; u < GPT; u++) {
                         unsigned q0, q1, q2, q3;
-                        si_nvfp4_i8x8(pw[u].x, q0, q1);
-                        si_nvfp4_i8x8(pw[u].y, q2, q3);
+                        si_nvfp4_i8x8<R>(pw[u].x, q0, q1);
+                        si_nvfp4_i8x8<R>(pw[u].y, q2, q3);
                         #pragma unroll
                         for (int r = 0; r < R; r++) {
                             int iacc = 0;
@@ -1250,8 +1260,8 @@ __global__ void gemv_nvfp4_rows_dp4a_kernel(const signed char* __restrict__ xq,
                 // CTA (2176 of them for a 17408-wide FFN matrix). Bit-identical.
                 const uint2 pw = __ldcs(reinterpret_cast<const uint2*>(prow + (size_t)g * 8));
                 unsigned q0, q1, q2, q3;
-                si_nvfp4_i8x8(pw.x, q0, q1);
-                si_nvfp4_i8x8(pw.y, q2, q3);
+                si_nvfp4_i8x8<R>(pw.x, q0, q1);
+                si_nvfp4_i8x8<R>(pw.y, q2, q3);
                 const float sw = si_ue4m3(__ldcs(srow + g)) * inv_g * 0.5f;
                 #pragma unroll
                 for (int r = 0; r < R; r++) {
@@ -3090,8 +3100,8 @@ __global__ void gemv_nvfp4_rows_dp4a2_kernel(const signed char* __restrict__ xq,
                     #pragma unroll
                     for (int u = 0; u < GPT; u++) {
                         unsigned q0, q1, q2, q3;
-                        si_nvfp4_i8x8(pw[u].x, q0, q1);
-                        si_nvfp4_i8x8(pw[u].y, q2, q3);
+                        si_nvfp4_i8x8<R>(pw[u].x, q0, q1);
+                        si_nvfp4_i8x8<R>(pw[u].y, q2, q3);
                         #pragma unroll
                         for (int r = 0; r < R; r++) {
                             int iacc = 0;
@@ -3121,8 +3131,8 @@ __global__ void gemv_nvfp4_rows_dp4a2_kernel(const signed char* __restrict__ xq,
                 const unsigned char* prow = w + (size_t)nj * (size_t)(K >> 1);
                 const uint2 pw = __ldcs(reinterpret_cast<const uint2*>(prow + (size_t)g * 8));
                 unsigned q0, q1, q2, q3;
-                si_nvfp4_i8x8(pw.x, q0, q1);
-                si_nvfp4_i8x8(pw.y, q2, q3);
+                si_nvfp4_i8x8<R>(pw.x, q0, q1);
+                si_nvfp4_i8x8<R>(pw.y, q2, q3);
                 const float sw = si_ue4m3(__ldcs(srow + g)) * inv_g * 0.5f;
                 #pragma unroll
                 for (int r = 0; r < R; r++) {
@@ -3216,20 +3226,23 @@ __global__ void gemv_nvfp4_rows_dp4a_pairwise_kernel(
                     sx[u][r] = xs[(size_t)r * ng + gu];
                 }
             }
+            // Consume each prefetched activation group in both matrices before moving on.
+            // This shortens its live range without removing the two-group prefetch. Each
+            // individual accumulator still visits groups in the original u=0,1 order.
 #pragma unroll
-            for (int b = 0; b < 2; ++b) {
+            for (int u = 0; u < GPT; ++u) {
+                const int gu = g + u * gstride;
 #pragma unroll
-                for (int j = 0; j < NR; ++j) {
-                    const int n = n0 + j;
-                    if (n >= N) break;
-                    const unsigned char* srow = sf[b] + (size_t)n * ng;
-                    const unsigned char* prow = w[b] + (size_t)n * (K >> 1);
+                for (int b = 0; b < 2; ++b) {
 #pragma unroll
-                    for (int u = 0; u < GPT; ++u) {
-                        const int gu = g + u * gstride;
+                    for (int j = 0; j < NR; ++j) {
+                        const int n = n0 + j;
+                        if (n >= N) break;
+                        const unsigned char* srow = sf[b] + (size_t)n * ng;
+                        const unsigned char* prow = w[b] + (size_t)n * (K >> 1);
                         const uint2 pw = __ldcs(reinterpret_cast<const uint2*>(prow + (size_t)gu * 8));
                         unsigned q0, q1, q2, q3;
-                        si_nvfp4_i8x8(pw.x, q0, q1); si_nvfp4_i8x8(pw.y, q2, q3);
+                        si_nvfp4_i8x8<R>(pw.x, q0, q1); si_nvfp4_i8x8<R>(pw.y, q2, q3);
                         const float sw = si_ue4m3(__ldcs(srow + gu)) * inv_g[b] * 0.5f;
 #pragma unroll
                         for (int r = 0; r < R; ++r) {
@@ -3259,7 +3272,7 @@ __global__ void gemv_nvfp4_rows_dp4a_pairwise_kernel(
                     const unsigned char* srow=sf[b]+(size_t)n*ng;
                     const unsigned char* prow=w[b]+(size_t)n*(K>>1);
                     const uint2 pw=__ldcs(reinterpret_cast<const uint2*>(prow+(size_t)g*8));
-                    unsigned q0,q1,q2,q3; si_nvfp4_i8x8(pw.x,q0,q1); si_nvfp4_i8x8(pw.y,q2,q3);
+                    unsigned q0,q1,q2,q3; si_nvfp4_i8x8<R>(pw.x,q0,q1); si_nvfp4_i8x8<R>(pw.y,q2,q3);
                     const float sw=si_ue4m3(__ldcs(srow+g))*inv_g[b]*0.5f;
 #pragma unroll
                     for (int r=0;r<R;++r) {
