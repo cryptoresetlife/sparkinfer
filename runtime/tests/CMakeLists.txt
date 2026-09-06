@@ -90,6 +90,10 @@ add_executable(qwen35_gpu_test qwen35_gpu_test.cpp)
 target_link_libraries(qwen35_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME qwen35_gpu_test COMMAND qwen35_gpu_test)
 
+add_executable(dense_prefill_scratch_gpu_test dense_prefill_scratch_gpu_test.cpp)
+target_link_libraries(dense_prefill_scratch_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME dense_prefill_scratch_gpu_test COMMAND dense_prefill_scratch_gpu_test)
+
 add_executable(dflash_gdn_checkpoint_gpu_test dflash_gdn_checkpoint_gpu_test.cpp)
 target_link_libraries(dflash_gdn_checkpoint_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME dflash_gdn_checkpoint_gpu_test COMMAND dflash_gdn_checkpoint_gpu_test)
