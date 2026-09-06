@@ -363,21 +363,33 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return *s.h_out_id;
     }
     pf_vram("entry");
+    // Dense layers run attention, post-attention norm, then FFN on one stream.
+    // Reuse storage only across those lifetime boundaries; Muse's sandwich norm
+    // and MoE's auxiliary streams retain the original independent allocations.
+    const bool dense_scratch = !moe && !c.muse_glimmer && H <= lvdim && H <= wide;
     bf16* x    = a.alloc<bf16>((size_t)N * H);
     bf16* xn   = a.alloc<bf16>((size_t)N * H);
-    bf16* hn   = a.alloc<bf16>((size_t)N * H);
-    bf16* ao   = a.alloc<bf16>((size_t)N * H);
+    bf16* hn   = dense_scratch ? nullptr : a.alloc<bf16>((size_t)N * H);
+    bf16* ao   = dense_scratch ? nullptr : a.alloc<bf16>((size_t)N * H);
     // Muse Glimmer sandwich norm keeps the post-attention residual stream (h = x + RMSNorm(ao)*
     // post_attn_norm) live across the FFN so the post-FFN sandwich can add onto it; other models
     // fold the residual in place and need no extra buffer.
     bf16* h    = c.muse_glimmer ? a.alloc<bf16>((size_t)N * H) : nullptr;
     bf16* b8   = a.alloc<bf16>((size_t)N * wide);        // qraw / lin_qkv (8192)
+    // Conv/split-q-gate consumes b8 before attention's output projection. Do
+    // not reuse xn: deferred norms can keep it live across a layer boundary.
+    if (dense_scratch) ao = b8;
     bf16* lz   = a.alloc<bf16>((size_t)N * lvdim);       // lin_z (4096)
     bf16* gq   = a.alloc<bf16>((size_t)N * s.linear_qdim);   // gdn q (2048)
     bf16* gk   = a.alloc<bf16>((size_t)N * s.linear_qdim);   // gdn k (2048)
     bf16* gv   = a.alloc<bf16>((size_t)N * lvdim);       // gdn v (4096)
     bf16* att  = a.alloc<bf16>((size_t)N * lvdim);       // attn out / gdn_out (4096)
-    bf16* lnrm = a.alloc<bf16>((size_t)N * lvdim);       // lin_norm (4096)
+    // The scan finishes reading gv before gated norm writes lnrm. Its other
+    // operands (att, lz) remain distinct: no kernel acquires an in-place alias.
+    bf16* lnrm = dense_scratch ? gv : a.alloc<bf16>((size_t)N * lvdim);
+    // Attention output is dead after its projection. FFN input then occupies
+    // att, separately from gate/up; consumed rows may hold raw down output.
+    if (dense_scratch) hn = att;
     bf16* la   = a.alloc<bf16>((size_t)N * vh);          // lin_alpha (32)
     bf16* lb   = a.alloc<bf16>((size_t)N * vh);          // lin_beta (32)
     // The previous window's trailing raw-qkv rows, staged out of the live conv state so the conv
@@ -396,7 +408,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // the GDN buffers they map onto are unused there (and vice-versa). Saves ~10K bf16/token of peak
     // scratch at long context (each is <= its GDN host: qdim/kvdim <= lvdim/linear_qdim).
     bf16* qb   = gv;                                     // full q      (4096) <- gdn v    (4096)
-    bf16* qg   = lnrm;                                   // full q-gate (4096) <- lin_norm (4096)
+    // lnrm aliases qb in dense layers, so put the full-attention gate in lz,
+    // whose GDN gate is unused in a full-attention layer.
+    bf16* qg   = dense_scratch ? lz : lnrm;
     bf16* kf   = gq;                                     // full k      (1024) <- gdn q    (2048)
     bf16* vf   = gk;                                     // full v      (1024) <- gdn k    (2048)
     const bool attn_vi8 = !c.muse_glimmer && c.hybrid && N >= 32768 &&
@@ -851,10 +865,29 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // model (6144 vs 5120), so fp4_a/fp4_as cannot be reused -- they would be overrun by a quarter
     // of a row. One staging pair sized for the widest GDN k covers all three projections.
     const int gdn_k = (lvdim > H) ? lvdim : H;
-    unsigned char* fp4_gdn_a = gdn_nvfp4
-        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, gdn_k)) : nullptr;
-    unsigned char* fp4_gdn_as = gdn_nvfp4
-        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, gdn_k)) : nullptr;
+    // Pack an activation and its scales into a dead bf16 host buffer when it
+    // fits. Keep CUDA's allocation alignment for both subregions, including
+    // padded scale layouts; unusual shapes retain independent allocations.
+    auto fp4_pair = [&](bool enabled, int cols, bf16* host, size_t host_bytes,
+                        unsigned char*& data, unsigned char*& scales) {
+        data = scales = nullptr;
+        if (!enabled) return;
+        const size_t db = kernels::prefill_nvfp4_data_bytes(N, cols);
+        const size_t sb = kernels::prefill_nvfp4_scale_bytes_a(N, cols);
+        const size_t offset = (db + 255) & ~size_t(255);
+        if (dense_scratch && host && offset <= host_bytes && sb <= host_bytes - offset) {
+            data = reinterpret_cast<unsigned char*>(host);
+            scales = data + offset;
+        } else {
+            data = a8.alloc<unsigned char>(db);
+            scales = a8.alloc<unsigned char>(sb);
+        }
+    };
+    // Input projections finish before conv writes gq. For out_proj, the scan
+    // has consumed gq already and lnrm is in the separate gv buffer.
+    unsigned char *fp4_gdn_a, *fp4_gdn_as;
+    fp4_pair(gdn_nvfp4, gdn_k, gq, (size_t)N * s.linear_qdim * sizeof(bf16),
+             fp4_gdn_a, fp4_gdn_as);
     // The three GDN shapes can each want more workspace than the FFN's, and fp4_ws is shared.
     unsigned char* fp4_gdn_ws = nullptr;
     if (gdn_nvfp4) {
@@ -904,10 +937,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // o's A operand is `att` at k = qdim (6144 here), wider than the q/k/v k = H, so one staging
     // pair sized for the widest of the two covers all four projections.
     const int attn_k = (qdim > H) ? qdim : H;
-    unsigned char* fp4_attn_a = attn_nvfp4
-        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_data_bytes(N, attn_k)) : nullptr;
-    unsigned char* fp4_attn_as = attn_nvfp4
-        ? a8.alloc<unsigned char>(kernels::prefill_nvfp4_scale_bytes_a(N, attn_k)) : nullptr;
+    // q/k/v consume the packed input before split writes qg=lz. The gate is
+    // then consumed before o-projection quantization reuses that same storage.
+    unsigned char *fp4_attn_a, *fp4_attn_as;
+    fp4_pair(attn_nvfp4, attn_k, lz, (size_t)N * lvdim * sizeof(bf16),
+             fp4_attn_a, fp4_attn_as);
     unsigned char* fp4_attn_ws = nullptr;
     if (attn_nvfp4) {
         size_t wb = kernels::prefill_nvfp4_workspace_bytes(N, wide_n, H);
@@ -938,6 +972,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
     }
 
+    if (pf_verbose) {
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        fprintf(stderr, "[prefill] dense scratch: a=%zu MB a8=%zu MB free=%zu MB "
+                        "a8_ok=%d attn_fp4=%d/%d/%d ffn_fp4=%d/%d/%d\n",
+                a.total() >> 20, a8.total() >> 20, free_bytes >> 20, (int)a8.ok,
+                fp4_attn_a != nullptr, fp4_attn_as != nullptr, fp4_attn_ws != nullptr,
+                fp4_a != nullptr, fp4_as != nullptr, fp4_ws != nullptr);
+    }
     // ---- MoE (Qwen3.6) scratch: expert-int8 weights + pair bucketing + pair-major hidden ----
     // The expert-grouped GEMMs run int8 tensor-core UNCONDITIONALLY (that is the speedup), so this
     // block carries its own int8 activation scratch (mA_i8/msx) and does not depend on the shared
@@ -1798,9 +1841,17 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             if (!attn_fused) kernels::launch_prefill_add(x, ao, x, (long)N * H, st);
             if (!ffn_norm_fp4)
                 kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+            // hn may reuse att's address (and, for some shapes, its width).
+            // Its new contents must never hit the attention quantization memo.
+            if (dense_scratch) { a_q = nullptr; a_pk = false; }
         }
 
+        bf16* const raw_ffn_out = ao;
         if (!moe) {
+            // Attention output has been added to x. Each FFN chunk consumes
+            // hn_c in gate/up before down writes these SAME rows; later chunks
+            // read disjoint rows. Do not write down into b8 (it holds ffg).
+            bf16* const ao = dense_scratch ? hn : raw_ffn_out;
             // dense SwiGLU FFN, chunked over tokens (upstream #530): ffg/ffu/A_i8 stay O(FC*ffn).
             // Third fallback, to the checkpoint's own NVFP4 payload. Under
             // SPARKINFER_QWEN38_DECODE_NVFP4 (ON by default) the loader makes those payloads the
