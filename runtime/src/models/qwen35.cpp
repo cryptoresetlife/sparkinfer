@@ -2999,6 +2999,12 @@ double Qwen35Model::bench_ttft(const std::vector<int>& prompt) {
 // buffers, streams and config it needs, so Impl stays private to this file.
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_logprob,
                                  int pos0) {
+    // This adapter can capture/replay a whole-prefill graph, just as
+    // forward_token captures decode. Exclude submit-time session allocation
+    // and legacy-stream copies until capture AND its first launch finish.
+    // The submit path already takes this mutex; ThreadLocal capture mode
+    // alone does not remove a blocking stream's legacy-stream dependencies.
+    std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     auto it = s.sessions.find(s.active_seq_id);
     float* lin_state = (it != s.sessions.end()) ? it->second.lin_state : s.lin_state;

@@ -12,6 +12,7 @@
 // shares no code with the decode path (qwen35.cpp keeps Impl private).
 
 #include "qwen35_prefill.h"
+#include "prefill_warm_key.h"
 #include "sparkinfer/kernels/prefill.h"
 #include "sparkinfer/kernels/vision.h"
 #include "sparkinfer/kernels/prefill_attn_window.h"
@@ -312,7 +313,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // stable source address and replay picks up new ids.
     static cudaGraph_t     g_pfb_graph = nullptr;
     static cudaGraphExec_t g_pfb_exec  = nullptr;
-    static int  g_pfb_n = -1, g_pfb_warm_n = -1, g_pfb_pin_cap = 0;
+    static int  g_pfb_n = -1, g_pfb_pin_cap = 0;
+    static PrefillWarmKey g_pfb_warm_key;
     static int* g_pfb_pin = nullptr;
     static const void* g_pfb_model_key = nullptr;
     static const void* g_pfb_lin_key = nullptr;
@@ -337,6 +339,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // the first window) still captures and still replays a graph an earlier pass left behind.
     const bool graph_on = graph_env && arena_reuse && c.dense_ffn && !capture_dflash && pos0 == 0;
     const void* const pfb_btable = s.kv->block_table(s.seq_id);
+    const PrefillWarmKey pfb_key{N, s.seq_id, s.w.lm_head, s.lin_state,
+                                 s.lin_conv_state, pfb_btable};
     // A whole-prefill graph embeds every pointer passed to its kernel nodes. The arena addresses
     // are deliberately stable, but recurrent state and the paged-KV block table are session-owned:
     // close_session() frees the former and a later same-length request may occupy another table
@@ -1168,7 +1172,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
     }
 
-    // Capture on the SECOND sighting of this N (arena warm => no cudaMalloc inside the capture).
+    // Warm arena storage is necessary but not sufficient for useful capture.
+    // A different session with the same N invalidates the graph's parameter
+    // pointers; capturing every new request would build and immediately discard
+    // a graph. Warm up the full identity, retaining capture for repeated use.
     bool pfb_capturing = false;
     // Re-capture when N changes: a graph is only valid for the N it recorded.
     if (graph_ok && g_pfb_exec && g_pfb_n != N) {
@@ -1176,7 +1183,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
         g_pfb_n = -1;
     }
-    if (graph_ok && !g_pfb_exec && g_pfb_warm_n == N) {
+    if (graph_ok && !g_pfb_exec && g_pfb_warm_key.matches(pfb_key)) {
         if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess)
             pfb_capturing = true;
     }
@@ -2732,7 +2739,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             return -1;
         }
     }
-    g_pfb_warm_n = N;
+    g_pfb_warm_key = pfb_key;
     pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "prefill seed");
     pf_cu(cudaStreamSynchronize(st), "prefill sync");
     int seed = *s.h_out_id;
@@ -2749,13 +2756,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         // (cudaGraphLaunch against a stale g_pfb_n match) would touch freed device memory and
         // segfault (#809: reproduced when a prefill N large enough to blow the keep-resident
         // budget was captured, then replayed 1+ more times after this cleanup ran). Tear the
-        // graph down here too and reset g_pfb_warm_n so the next call redoes the warm-then-
+        // graph down here too and reset the warm key so the next call redoes the warm-then-
         // capture cycle against fresh (post-free) addresses rather than capturing over a cold
         // allocation.
         if (g_pfb_exec)  { cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr; }
         if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
         g_pfb_n = -1;
-        g_pfb_warm_n = -1;
+        g_pfb_warm_key = {};
     }
     return seed;
 }
