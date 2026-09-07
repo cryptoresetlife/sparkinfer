@@ -1118,7 +1118,7 @@ __device__ __forceinline__ void si_nvfp4_i8x8(unsigned p, unsigned& q0, unsigned
     const unsigned s0 = __byte_perm(SGN, 0u, ssel);
     const unsigned m1 = __byte_perm(MAG_LO, MAG_HI, msel >> 16);
     const unsigned s1 = __byte_perm(SGN, 0u, ssel >> 16);
-    if constexpr (R <= 4) {
+    if constexpr (R >= 2 && R <= 4) {
         const unsigned NEG_LO = 0xFDFEFF00u;   // {0, -1, -2, -3}
         const unsigned NEG_HI = 0xF4F8FAFCu;   // {-4, -6, -8, -12}
         const unsigned n0 = __byte_perm(NEG_LO, NEG_HI, msel);
