@@ -90,11 +90,12 @@ add_executable(qwen35_gpu_test qwen35_gpu_test.cpp)
 target_link_libraries(qwen35_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME qwen35_gpu_test COMMAND qwen35_gpu_test)
 
-add_executable(dense_prefill_scratch_gpu_test dense_prefill_scratch_gpu_test.cpp)
-target_link_libraries(dense_prefill_scratch_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
-add_test(NAME dense_prefill_scratch_gpu_test COMMAND dense_prefill_scratch_gpu_test)
-
 add_executable(dflash_gdn_checkpoint_gpu_test dflash_gdn_checkpoint_gpu_test.cpp)
+add_executable(prefill_device_lock_gpu_test prefill_device_lock_gpu_test.cpp)
+target_link_libraries(prefill_device_lock_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
+add_test(NAME prefill_device_lock_gpu_test COMMAND prefill_device_lock_gpu_test)
+set_tests_properties(prefill_device_lock_gpu_test PROPERTIES TIMEOUT 20)
+
 target_link_libraries(dflash_gdn_checkpoint_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
 add_test(NAME dflash_gdn_checkpoint_gpu_test COMMAND dflash_gdn_checkpoint_gpu_test)
 
@@ -109,3 +110,11 @@ add_executable(qwen_vision_video_cpu_test qwen_vision_video_cpu_test.cpp
 target_include_directories(qwen_vision_video_cpu_test PRIVATE ../include)
 set_target_properties(qwen_vision_video_cpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME qwen_vision_video_cpu_test COMMAND qwen_vision_video_cpu_test)
+
+add_executable(prefill_warm_key_cpu_test prefill_warm_key_cpu_test.cpp)
+set_target_properties(prefill_warm_key_cpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME prefill_warm_key_cpu_test COMMAND prefill_warm_key_cpu_test)
+
+add_executable(dense_prefill_scratch_gpu_test dense_prefill_scratch_gpu_test.cpp)
+target_link_libraries(dense_prefill_scratch_gpu_test PRIVATE sparkinfer_runtime CUDA::cudart)
+add_test(NAME dense_prefill_scratch_gpu_test COMMAND dense_prefill_scratch_gpu_test)
