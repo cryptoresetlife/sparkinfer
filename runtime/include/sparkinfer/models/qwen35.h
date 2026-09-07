@@ -193,7 +193,7 @@ public:
     void set_weights(const Qwen35Weights& w);
 
     // Serializes CUDA-graph capture against any OTHER thread issuing work on the legacy default
-    // stream. Capture happens inside forward_token on the continuous-batch worker thread; the HTTP
+    // stream. Capture happens inside forward_token and prefill_batched on the worker thread; the HTTP
     // thread concurrently runs submit-time device work (KVCacheManager::allocate's block-table
     // cudaMemcpy, open_session's cudaMalloc, reset_penalty_counts, set_logit_bias).
     //
